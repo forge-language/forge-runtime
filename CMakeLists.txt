@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.16)
+project(ForgeRuntime VERSION 0.3.0 LANGUAGES C)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+find_package(Threads REQUIRED)
+
+add_library(forge_runtime STATIC
+    src/arena.c src/scheduler.c src/work_queue.c src/event_loop.c
+    src/ownership.c src/platform.c src/thread.c)
+add_library(ForgeRuntime::runtime ALIAS forge_runtime)
+set_target_properties(forge_runtime PROPERTIES EXPORT_NAME runtime)
+target_include_directories(forge_runtime PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(forge_runtime PUBLIC Threads::Threads)
+if(WIN32)
+    target_link_libraries(forge_runtime PUBLIC ws2_32)
+else()
+    target_compile_definitions(forge_runtime PRIVATE _GNU_SOURCE)
+endif()
+if(MSVC)
+    target_compile_options(forge_runtime PRIVATE /W4)
+else()
+    target_compile_options(forge_runtime PRIVATE -Wall -Wextra)
+endif()
+install(TARGETS forge_runtime EXPORT ForgeRuntimeTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT ForgeRuntimeTargets NAMESPACE ForgeRuntime:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ForgeRuntime)
+configure_package_config_file(cmake/ForgeRuntimeConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/ForgeRuntimeConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ForgeRuntime)
+write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/ForgeRuntimeConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ForgeRuntimeConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/ForgeRuntimeConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ForgeRuntime)
+include(CTest)
+if(BUILD_TESTING)
+    set(runtime_tests arena work_queue)
+    if(UNIX)
+        list(APPEND runtime_tests scheduler)
+    endif()
+    foreach(name IN LISTS runtime_tests)
+        add_executable(${name}_test "tests/${name}_test.c")
+        target_link_libraries(${name}_test PRIVATE ForgeRuntime::runtime)
+        target_include_directories(${name}_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        if(MSVC)
+            target_compile_options(${name}_test PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${name}_test PRIVATE -UNDEBUG)
+        endif()
+        add_test(NAME ${name}_regressions COMMAND ${name}_test)
+        set_tests_properties(${name}_regressions PROPERTIES TIMEOUT 30)
+    endforeach()
+endif()
+
+install(FILES LICENSE NOTICE DESTINATION ${CMAKE_INSTALL_DATADIR}/forge-runtime)
