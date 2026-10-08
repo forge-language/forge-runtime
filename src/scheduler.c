@@ -85,6 +85,7 @@ struct fr_scheduler {
 
 static _Thread_local fr_coro_t *tls_current_coro = NULL;
 static _Thread_local int tls_worker_id = -1;
+static _Thread_local fr_scheduler_t *tls_worker_scheduler = NULL;
 static _Atomic(fr_scheduler_t *) g_global_sched = NULL;
 
 fr_coro_t *fr_coro_current(void) {
@@ -213,6 +214,7 @@ static void *worker_main(void *arg) {
     int cpus = fr_platform_cpu_count();
     if (cpus > 0) fr_thread_pin_cpu(wid % cpus);
     tls_worker_id = wid;
+    tls_worker_scheduler = sched;
 
     for (;;) {
         fr_mutex_lock(sched->lock);
@@ -279,6 +281,7 @@ static void *worker_main(void *arg) {
         fr_mutex_unlock(sched->lock);
     }
     tls_worker_id = -1;
+    tls_worker_scheduler = NULL;
     return NULL;
 }
 
@@ -458,6 +461,16 @@ void fr_sched_pool_spawn_indexed(fr_sched_native_fn2_t fn, int64_t count) {
     if (!sched || !sched->running || !fn || count <= 0) return;
     if (count > sched->worker_count * 64) count = sched->worker_count * 64;
 
+    /* This API waits for the batch to finish. A worker must not enqueue a
+     * nested batch and block on its own pool: one worker (or all busy parents)
+     * leaves no worker available to run the children. Keep nested same-pool
+     * batches synchronous and inline; callers outside the pool retain the
+     * parallel path below. No extra threads or ownership changes are needed. */
+    if (tls_worker_scheduler == sched) {
+        for (int64_t i = 0; i < count; i++) fn(i, count);
+        return;
+    }
+
     fr_mutex_t *lock = fr_mutex_create();
     fr_cond_t *done = fr_cond_create();
     int remaining = 0;
@@ -633,13 +646,15 @@ void fr_coro_set_step(fr_coro_t *coro, int step) {
     if (coro) coro->step = step;
 }
 
-void fr_send(fr_process_t *dst, int tag, int64_t value, void *payload, size_t payload_size) {
-    if (!dst) return;
+int fr_send(fr_process_t *dst, int tag, int64_t value, void *payload, size_t payload_size) {
+    /* A send consumes its heap payload even when delivery is impossible. */
+    if (!dst) { free(payload); return 0; }
     fr_msg_t msg = { tag, value, payload, payload_size, payload ? 1 : 0, NULL };
     fr_mutex_lock(dst->lock);
-    mailbox_push(&dst->mailbox, msg);
-    fr_cond_broadcast(dst->msg_cond);
+    int accepted = mailbox_push(&dst->mailbox, msg);
+    if (accepted) fr_cond_broadcast(dst->msg_cond);
     fr_mutex_unlock(dst->lock);
+    if (!accepted) { free(payload); return 0; }
     if (dst->sched) {
         fr_mutex_lock(dst->sched->lock);
         for (fr_coro_t *c = dst->coros; c; c = c->next) {
@@ -650,6 +665,7 @@ void fr_send(fr_process_t *dst, int tag, int64_t value, void *payload, size_t pa
         }
         fr_mutex_unlock(dst->sched->lock);
     }
+    return 1;
 }
 
 int fr_try_recv(fr_process_t *self, fr_msg_t *out) {

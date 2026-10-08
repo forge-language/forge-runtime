@@ -80,10 +80,11 @@ fr_coro_t *fr_coro_current(void);
  * on a different OS thread. */
 fr_arena_t *fr_coro_get_arena(fr_coro_t *coro);
 
-/* Returns 1 if the message was enqueued, 0 if the mailbox was full and it
- * was dropped (payload ownership is released either way -- on drop the
- * caller's payload is freed here to avoid a leak). */
-void fr_send(fr_process_t *dst, int tag, int64_t value, void *payload, size_t payload_size);
+/* Returns 1 if enqueued, 0 if the mailbox is full or the destination is NULL.
+ * A heap payload is consumed in either case: the receiver owns an accepted
+ * payload; a rejected payload is freed here. The caller must not reuse the
+ * payload after sending, including when delivery fails. */
+int fr_send(fr_process_t *dst, int tag, int64_t value, void *payload, size_t payload_size);
 int fr_try_recv(fr_process_t *self, fr_msg_t *out);
 int fr_recv(fr_process_t *self, fr_msg_t *out);
 void fr_msg_free_payload(fr_msg_t *msg);

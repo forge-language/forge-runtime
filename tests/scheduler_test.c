@@ -79,6 +79,93 @@ static void test_await(int immediate) {
     close(fds[0]); close(fds[1]);
 }
 
+/* The mailbox is bounded. Every accepted message retains FIFO order, and
+ * rejected sends consume their transferred heap payloads (also checked by
+ * LeakSanitizer). Never retry using the pointer after either send outcome. */
+static void test_mailbox_overflow(void) {
+    fr_process_t *proc = fr_process_create("mailbox-capacity");
+    CHECK(proc);
+    for (int i = 0; i < 300; i++) {
+        int *payload = malloc(sizeof(*payload));
+        CHECK(payload);
+        *payload = i;
+        CHECK(fr_send(proc, i, i, payload, sizeof(*payload)) == (i < 256));
+    }
+    fr_msg_t message;
+    for (int i = 0; i < 256; i++) {
+        CHECK(fr_try_recv(proc, &message));
+        CHECK(message.tag == i && message.value == i);
+        CHECK(message.owns_payload && message.payload_size == sizeof(int));
+        CHECK(*(int *)message.payload == i);
+        fr_msg_free_payload(&message);
+        CHECK(!message.owns_payload && !message.payload);
+    }
+    CHECK(!fr_try_recv(proc, &message));
+    CHECK(fr_send(proc, 301, 301, NULL, 0) == 1);
+    CHECK(fr_try_recv(proc, &message) && message.tag == 301);
+    fr_process_destroy(proc);
+    int *undeliverable = malloc(sizeof(*undeliverable));
+    CHECK(undeliverable);
+    *undeliverable = 42;
+    CHECK(fr_send(NULL, 1, 42, undeliverable, sizeof(*undeliverable)) == 0);
+    CHECK(fr_send(NULL, 1, 42, NULL, 0) == 0);
+}
+
+/* Synchronous indexed batches called from their own worker pool must not
+ * deadlock when the pool has one worker or every worker is a waiting parent. */
+static atomic_int indexed_parents_started, indexed_parents_done;
+static atomic_int indexed_children[3];
+static int64_t indexed_child(int64_t id, int64_t total) {
+    CHECK(total == 3 && id >= 0 && id < total);
+    atomic_fetch_add(&indexed_children[id], 1);
+    return 0;
+}
+static void indexed_parent(void *arg) {
+    int parents = *(int *)arg;
+    atomic_fetch_add(&indexed_parents_started, 1);
+    while (atomic_load(&indexed_parents_started) < parents) fr_thread_yield();
+    fr_sched_pool_spawn_indexed(indexed_child, 3);
+    atomic_fetch_add(&indexed_parents_done, 1);
+}
+static void test_nested_indexed_batch(int workers) {
+    atomic_store(&indexed_parents_started, 0);
+    atomic_store(&indexed_parents_done, 0);
+    for (int i = 0; i < 3; i++) atomic_store(&indexed_children[i], 0);
+    fr_scheduler_t *sched = fr_scheduler_create(workers);
+    CHECK(sched);
+    for (int i = 0; i < workers; i++)
+        CHECK(fr_sched_pool_submit(sched, indexed_parent, &workers) == 0);
+    fr_scheduler_run(sched);
+    CHECK(atomic_load(&indexed_parents_done) == workers);
+    for (int i = 0; i < 3; i++) CHECK(atomic_load(&indexed_children[i]) == workers);
+    fr_scheduler_destroy(sched);
+}
+static void test_external_indexed_batch(void) {
+    for (int i = 0; i < 3; i++) atomic_store(&indexed_children[i], 0);
+    fr_scheduler_t *sched = fr_scheduler_create(4);
+    CHECK(sched);
+    fr_scheduler_start(sched);
+    fr_sched_pool_spawn_indexed(indexed_child, 3);
+    for (int i = 0; i < 3; i++) CHECK(atomic_load(&indexed_children[i]) == 1);
+    fr_scheduler_destroy(sched);
+}
+static fr_coro_status_t indexed_coro(fr_coro_t *coro, void *state) {
+    (void)coro; (void)state;
+    fr_sched_pool_spawn_indexed(indexed_child, 3);
+    return FR_CORO_DONE;
+}
+static void test_coro_indexed_batch(void) {
+    for (int i = 0; i < 3; i++) atomic_store(&indexed_children[i], 0);
+    fr_scheduler_t *sched = fr_scheduler_create(1);
+    fr_process_t *proc = fr_process_create("indexed-coro");
+    CHECK(sched && proc);
+    fr_scheduler_add_process(sched, proc);
+    CHECK(fr_coro_spawn(proc, indexed_coro, NULL, 0));
+    fr_scheduler_run(sched);
+    for (int i = 0; i < 3; i++) CHECK(atomic_load(&indexed_children[i]) == 1);
+    fr_scheduler_destroy(sched);
+}
+
 static atomic_int native_completed;
 static void native_job(void *arg) {
     (void)arg;
@@ -285,6 +372,11 @@ int main(void) {
     test_await(0);
     test_await(1);
     test_native_completion();
+    test_mailbox_overflow();
+    test_nested_indexed_batch(1);
+    test_nested_indexed_batch(4);
+    test_coro_indexed_batch();
+    test_external_indexed_batch();
     test_idle_wakeup();
     test_stop_waiting();
     test_receive_wakeup();
