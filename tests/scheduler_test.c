@@ -343,6 +343,50 @@ static void test_attach_spawn_and_restart(void) {
     fr_scheduler_destroy(sched);
 }
 
+typedef struct { writer_state_t writer; int delay_ms; } mixed_writer_state_t;
+static void *mixed_writer(void *arg) {
+    mixed_writer_state_t *state = arg;
+    pause_ms(state->delay_ms);
+    return writer(&state->writer);
+}
+
+/* Complete both kinds of work, regardless of whether native jobs or a reader
+ * finishes last. Register I/O amid a batch so the run loop must switch from
+ * waiting for state changes to polling even without per-job completion wakes. */
+static void test_mixed_batch_and_delayed_io(void) {
+    for (int workers = 1; workers <= 4; workers += 3) {
+        for (int delayed = 0; delayed < 2; delayed++) {
+            int fds[2];
+            CHECK(pipe(fds) == 0);
+            atomic_int tasks_completed = 0, io_completed = 0, executing = 0;
+            atomic_store(&native_completed, 0);
+            fr_scheduler_t *sched = fr_scheduler_create(workers);
+            fr_process_t *proc = fr_process_create("mixed-batch");
+            CHECK(sched && proc);
+            fr_scheduler_add_process(sched, proc);
+            for (int i = 0; i < 1000; i++) spawn_counted(proc, &tasks_completed, 0, 0);
+            reader_state_t *state = malloc(sizeof(*state));
+            CHECK(state);
+            *state = (reader_state_t){fds[0], 0, 6, 0, &executing, &io_completed};
+            CHECK(fr_coro_spawn(proc, reader, state, sizeof(*state)));
+            for (int i = 0; i < 8; i++) CHECK(fr_sched_pool_submit(sched, native_job, NULL) == 0);
+            mixed_writer_state_t write_state = {{fds[1], 6}, delayed ? 100 : 0};
+            fr_thread_t *thread = NULL;
+            CHECK(fr_thread_start(&thread, mixed_writer, &write_state) == 0);
+            fr_scheduler_run(sched);
+            CHECK(fr_thread_join(thread) == 0);
+            CHECK(atomic_load(&tasks_completed) == 1000);
+            CHECK(atomic_load(&native_completed) == 8);
+            CHECK(atomic_load(&io_completed) == 6);
+            CHECK(atomic_load(&executing) == 0);
+            fr_scheduler_run(sched);
+            CHECK(atomic_load(&native_completed) == 8);
+            fr_scheduler_destroy(sched);
+            close(fds[0]); close(fds[1]);
+        }
+    }
+}
+
 static fr_coro_status_t failed_await(fr_coro_t *coro, void *arg) {
     int fd = *(int *)arg;
     CHECK(fr_await_fd(coro, fd, FR_EVENT_READ) == -1);
@@ -382,6 +426,7 @@ int main(void) {
     test_receive_wakeup();
     test_external_stop();
     test_attach_spawn_and_restart();
+    test_mixed_batch_and_delayed_io();
 #if defined(__linux__) || defined(__APPLE__)
     test_await_registration_failure();
 #endif

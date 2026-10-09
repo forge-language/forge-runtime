@@ -205,6 +205,14 @@ typedef struct {
     int wid;
 } fr_worker_arg_t;
 
+/* The run-loop predicate needs a completion wake only when all work is done.
+ * I/O registration has its own wake, and stop still broadcasts to all waiters.
+ * Test this predicate while holding the same mutex as fr_scheduler_run. */
+static void notify_completion_locked(fr_scheduler_t *sched) {
+    if (sched->active_coros == 0 && sched->native_pending == 0)
+        fr_cond_signal(sched->state_cond);
+}
+
 static void *worker_main(void *arg) {
     fr_worker_arg_t *wa = (fr_worker_arg_t *)arg;
     fr_scheduler_t *sched = wa->sched;
@@ -256,7 +264,7 @@ static void *worker_main(void *arg) {
             coro->status = status;
             refresh_coro_counts_locked(sched, coro);
             enqueue_coro_locked(sched, coro);
-            fr_cond_signal(sched->state_cond);
+            notify_completion_locked(sched);
             fr_mutex_unlock(sched->lock);
             continue;
         }
@@ -276,7 +284,7 @@ static void *worker_main(void *arg) {
             nfn(narg);
             fr_mutex_lock(sched->lock);
             sched->native_pending--;
-            fr_cond_signal(sched->state_cond);
+            notify_completion_locked(sched);
         }
         fr_mutex_unlock(sched->lock);
     }
