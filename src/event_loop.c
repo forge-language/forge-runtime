@@ -4,6 +4,7 @@
 #include <string.h>
 
 #if defined(FORGE_OS_LINUX)
+#include <errno.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 #elif defined(FORGE_OS_MACOS)
@@ -37,6 +38,18 @@ struct fr_event_loop {
 #endif
     fr_event_cb_t cb;
 };
+
+#if defined(FORGE_OS_LINUX)
+static void fr_epoll_configure(struct epoll_event *ev, uint32_t events, void *userdata) {
+    uint32_t oneshot = events & FR_EVENT_ONESHOT;
+    events &= ~FR_EVENT_ONESHOT;
+    memset(ev, 0, sizeof(*ev));
+    if (events & FR_EVENT_READ) ev->events |= EPOLLIN;
+    if (events & FR_EVENT_WRITE) ev->events |= EPOLLOUT;
+    if (oneshot) ev->events |= EPOLLONESHOT;
+    ev->data.ptr = userdata;
+}
+#endif
 
 fr_event_loop_t *fr_event_loop_create(void) {
     fr_event_loop_t *loop = (fr_event_loop_t *)calloc(1, sizeof(fr_event_loop_t));
@@ -82,12 +95,8 @@ int fr_event_loop_add(fr_event_loop_t *loop, int fd, uint32_t events, void *user
     events &= ~FR_EVENT_ONESHOT;
 #if defined(FORGE_OS_LINUX)
     struct epoll_event ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.events = 0;
-    if (events & FR_EVENT_READ) ev.events |= EPOLLIN;
-    if (events & FR_EVENT_WRITE) ev.events |= EPOLLOUT;
-    if (oneshot) ev.events |= EPOLLONESHOT;
-    ev.data.ptr = userdata;
+    (void)oneshot;
+    fr_epoll_configure(&ev, events | oneshot, userdata);
     return epoll_ctl(loop->epfd, EPOLL_CTL_ADD, fd, &ev);
 #elif defined(FORGE_OS_MACOS)
     struct kevent changes[2];
@@ -112,8 +121,17 @@ int fr_event_loop_add(fr_event_loop_t *loop, int fd, uint32_t events, void *user
 }
 
 int fr_event_loop_mod(fr_event_loop_t *loop, int fd, uint32_t events, void *userdata) {
+#if defined(FORGE_OS_LINUX)
+    if (!loop || fd < 0) return -1;
+    struct epoll_event ev;
+    fr_epoll_configure(&ev, events, userdata);
+    if (epoll_ctl(loop->epfd, EPOLL_CTL_MOD, fd, &ev) == 0) return 0;
+    if (errno != ENOENT) return -1;
+    return epoll_ctl(loop->epfd, EPOLL_CTL_ADD, fd, &ev);
+#else
     fr_event_loop_del(loop, fd);
     return fr_event_loop_add(loop, fd, events, userdata);
+#endif
 }
 
 int fr_event_loop_del(fr_event_loop_t *loop, int fd) {
