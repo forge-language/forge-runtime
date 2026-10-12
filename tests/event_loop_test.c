@@ -2,12 +2,16 @@
 
 #include <assert.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
 static void *seen_userdata;
 static uint32_t seen_events;
 static int callback_count;
+static uint8_t *burst_seen;
+static uint32_t burst_count;
+static uint32_t burst_observed;
 
 static void record_event(fr_event_loop_t *loop, int fd, uint32_t events, void *userdata) {
     (void)loop;
@@ -15,6 +19,18 @@ static void record_event(fr_event_loop_t *loop, int fd, uint32_t events, void *u
     seen_userdata = userdata;
     seen_events = events;
     callback_count++;
+}
+
+static void record_burst_event(fr_event_loop_t *loop, int fd, uint32_t events, void *userdata) {
+    (void)loop;
+    (void)fd;
+    (void)events;
+    uintptr_t index = (uintptr_t)userdata;
+    assert(index < burst_count);
+    if (!burst_seen[index]) {
+        burst_seen[index] = 1;
+        burst_observed++;
+    }
 }
 
 static void signal_eventfd(int fd) {
@@ -55,5 +71,30 @@ int main(void) {
     assert(fr_event_loop_mod(loop, -1, FR_EVENT_READ, NULL) == -1);
     fr_event_loop_destroy(loop);
     close(fd);
+
+    enum { READY_FDS = 300 };
+    fr_event_loop_t *burst_loop = fr_event_loop_create();
+    assert(burst_loop);
+    int burst_fds[READY_FDS];
+    burst_seen = calloc(READY_FDS, sizeof(*burst_seen));
+    assert(burst_seen);
+    burst_count = READY_FDS;
+    fr_event_loop_set_cb(burst_loop, record_burst_event);
+    for (uintptr_t i = 0; i < READY_FDS; i++) {
+        burst_fds[i] = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        assert(burst_fds[i] >= 0);
+        assert(fr_event_loop_add(burst_loop, burst_fds[i], FR_EVENT_READ,
+                                 (void *)i) == 0);
+    }
+    for (int i = 0; i < READY_FDS; i++) signal_eventfd(burst_fds[i]);
+    int polls = 0;
+    while (burst_observed < READY_FDS) {
+        assert(fr_event_loop_poll(burst_loop, 0) > 0);
+        assert(++polls <= 8);
+    }
+    assert(burst_observed == READY_FDS);
+    fr_event_loop_destroy(burst_loop);
+    for (int i = 0; i < READY_FDS; i++) close(burst_fds[i]);
+    free(burst_seen);
     return 0;
 }

@@ -19,6 +19,9 @@
 #endif
 
 #define FR_EVENT_ONESHOT 0x80000000u
+#ifndef FR_EVENT_BATCH_CAPACITY
+#define FR_EVENT_BATCH_CAPACITY 256
+#endif
 
 struct fr_event_entry {
     int fd;
@@ -154,15 +157,15 @@ int fr_event_loop_del(fr_event_loop_t *loop, int fd) {
 int fr_event_loop_poll(fr_event_loop_t *loop, int timeout_ms) {
     if (!loop) return -1;
 #if defined(FORGE_OS_LINUX)
-    struct epoll_event events[64];
-    int n = epoll_wait(loop->epfd, events, 64, timeout_ms);
+    struct epoll_event events[FR_EVENT_BATCH_CAPACITY];
+    int n = epoll_wait(loop->epfd, events, FR_EVENT_BATCH_CAPACITY, timeout_ms);
     if (n < 0) return -1;
     for (int i = 0; i < n; i++) {
         if (loop->cb) loop->cb(loop, 0, events[i].events, events[i].data.ptr);
     }
     return n;
 #elif defined(FORGE_OS_MACOS)
-    struct kevent events[64];
+    struct kevent events[FR_EVENT_BATCH_CAPACITY];
     struct timespec ts;
     struct timespec *tp = NULL;
     if (timeout_ms >= 0) {
@@ -170,7 +173,7 @@ int fr_event_loop_poll(fr_event_loop_t *loop, int timeout_ms) {
         ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
         tp = &ts;
     }
-    int n = kevent(loop->kqfd, NULL, 0, events, 64, tp);
+    int n = kevent(loop->kqfd, NULL, 0, events, FR_EVENT_BATCH_CAPACITY, tp);
     if (n < 0) return -1;
     for (int i = 0; i < n; i++) {
         uint32_t ev = 0;
