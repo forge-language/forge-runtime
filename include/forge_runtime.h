@@ -64,8 +64,16 @@ fr_scheduler_t *fr_process_scheduler(fr_process_t *proc);
 const char *fr_process_name(fr_process_t *proc);
 void fr_process_set_receive_handler(fr_process_t *proc, fr_coro_fn handler, size_t state_size);
 
+/* On success the runtime takes ownership of heap-allocated init_state and
+ * frees it when the owning process destroys the coroutine. On failure, the
+ * caller retains ownership. A zero-sized state may use NULL. */
 fr_coro_t *fr_coro_spawn(fr_process_t *proc, fr_coro_fn fn, void *init_state, size_t state_size);
 fr_coro_status_t fr_yield(fr_coro_t *coro);
+/* Generated coroutine code may continue through a logical yield in the same
+ * worker invocation while its reduction budget remains. Returns nonzero when
+ * the coroutine must return to the scheduler. Outside an active worker call,
+ * it always requests a return so direct callers retain ordinary yield behavior. */
+int fr_coro_inline_yield(fr_coro_t *coro, int next_step);
 int fr_coro_id(fr_coro_t *coro);
 fr_process_t *fr_coro_process(fr_coro_t *coro);
 int fr_coro_step(fr_coro_t *coro);

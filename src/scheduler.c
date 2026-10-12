@@ -86,6 +86,7 @@ struct fr_scheduler {
 static _Thread_local fr_coro_t *tls_current_coro = NULL;
 static _Thread_local int tls_worker_id = -1;
 static _Thread_local fr_scheduler_t *tls_worker_scheduler = NULL;
+static _Thread_local int *tls_reductions_remaining = NULL;
 static _Atomic(fr_scheduler_t *) g_global_sched = NULL;
 
 fr_coro_t *fr_coro_current(void) {
@@ -246,11 +247,13 @@ static void *worker_main(void *arg) {
             fr_coro_status_t status = FR_CORO_RUNNING;
             int budget = FR_REDUCTION_BUDGET;
             tls_current_coro = coro;
+            tls_reductions_remaining = &budget;
             while (budget-- > 0 && sched->running) {
                 status = coro->fn(coro, coro->state);
                 if (status == FR_CORO_YIELDED) status = FR_CORO_RUNNING;
                 if (status != FR_CORO_RUNNING) break;
             }
+            tls_reductions_remaining = NULL;
             tls_current_coro = NULL;
             fr_mutex_lock(sched->lock);
             coro->executing = 0;
@@ -605,15 +608,21 @@ void fr_process_set_receive_handler(fr_process_t *proc, fr_coro_fn handler, size
 fr_coro_t *fr_coro_spawn(fr_process_t *proc, fr_coro_fn fn, void *init_state, size_t state_size) {
     fr_coro_t *c = (fr_coro_t *)calloc(1, sizeof(fr_coro_t));
     if (!c) return NULL;
-    if (!fn) { free(c); return NULL; }
+    if (!fn || (state_size && !init_state)) { free(c); return NULL; }
     c->fn = fn;
     c->state_size = state_size;
-    c->state = malloc(state_size ? state_size : 1);
-    if (!c->state) {
-        free(c);
-        return NULL;
+    if (state_size) {
+        /* Generated spawn stubs already build an owned, initialized state
+         * object. Keep it instead of allocating, copying, and freeing it. */
+        c->state = init_state;
+    } else {
+        c->state = malloc(1);
+        if (!c->state) {
+            free(c);
+            return NULL;
+        }
+        free(init_state);
     }
-    if (state_size) memcpy(c->state, init_state, state_size);
     c->status = FR_CORO_RUNNING;
     c->step = 0;
     c->proc = proc;
@@ -623,7 +632,6 @@ fr_coro_t *fr_coro_spawn(fr_process_t *proc, fr_coro_fn fn, void *init_state, si
     c->id = proc->next_coro_id++;
     if (!proc->coros) proc->coros = proc->coro_tail = c;
     else { proc->coro_tail->next = c; proc->coro_tail = c; }
-    free(init_state);
     fr_mutex_unlock(proc->lock);
     if (proc->sched) {
         refresh_coro_counts_locked(proc->sched, c);
@@ -636,6 +644,17 @@ fr_coro_t *fr_coro_spawn(fr_process_t *proc, fr_coro_fn fn, void *init_state, si
 fr_coro_status_t fr_yield(fr_coro_t *coro) {
     (void)coro;
     return FR_CORO_YIELDED;
+}
+
+int fr_coro_inline_yield(fr_coro_t *coro, int next_step) {
+    if (!coro || coro != tls_current_coro || !tls_worker_scheduler ||
+        !tls_reductions_remaining || !tls_worker_scheduler->running ||
+        *tls_reductions_remaining <= 0) {
+        if (coro) coro->step = next_step;
+        return 1;
+    }
+    --*tls_reductions_remaining;
+    return 0;
 }
 
 int fr_coro_id(fr_coro_t *coro) {

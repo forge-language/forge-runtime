@@ -343,6 +343,61 @@ static void test_attach_spawn_and_restart(void) {
     fr_scheduler_destroy(sched);
 }
 
+typedef struct {
+    int yields;
+    atomic_int *short_done;
+    atomic_int *resume_saw_short;
+    atomic_int *finished_yields;
+} inline_yield_state_t;
+
+static fr_coro_status_t inline_yielder(fr_coro_t *coro, void *arg) {
+    inline_yield_state_t *state = arg;
+    if (state->yields == 2000)
+        atomic_store(state->resume_saw_short, atomic_load(state->short_done));
+    while (state->yields < 2500) {
+        state->yields++;
+        if (fr_coro_inline_yield(coro, state->yields)) {
+            CHECK(fr_coro_step(coro) == state->yields);
+            return FR_CORO_YIELDED;
+        }
+    }
+    atomic_store(state->finished_yields, state->yields);
+    return FR_CORO_DONE;
+}
+
+static fr_coro_status_t short_task(fr_coro_t *coro, void *arg) {
+    (void)coro;
+    atomic_store(*(atomic_int **)arg, 1);
+    return FR_CORO_DONE;
+}
+
+static void test_inline_yield_preserves_reduction_budget(void) {
+    atomic_int short_done = 0;
+    atomic_int resume_saw_short = 0;
+    atomic_int finished_yields = 0;
+    fr_scheduler_t *sched = fr_scheduler_create(1);
+    fr_process_t *proc = fr_process_create("inline-yield-budget");
+    CHECK(sched && proc);
+    fr_scheduler_add_process(sched, proc);
+
+    inline_yield_state_t *long_state = malloc(sizeof(*long_state));
+    CHECK(long_state);
+    *long_state = (inline_yield_state_t){0, &short_done, &resume_saw_short, &finished_yields};
+    CHECK(fr_coro_spawn(proc, inline_yielder, long_state, sizeof(*long_state)));
+    atomic_int **short_arg = malloc(sizeof(*short_arg));
+    CHECK(short_arg);
+    *short_arg = &short_done;
+    CHECK(fr_coro_spawn(proc, short_task, short_arg, sizeof(*short_arg)));
+
+    fr_scheduler_run(sched);
+    CHECK(atomic_load(&short_done) == 1);
+    CHECK(atomic_load(&resume_saw_short) == 1);
+    CHECK(atomic_load(&finished_yields) == 2500);
+    /* The long task must return after the 2000-step reduction budget and let
+     * the already queued short task run before its second activation. */
+    fr_scheduler_destroy(sched);
+}
+
 typedef struct { writer_state_t writer; int delay_ms; } mixed_writer_state_t;
 static void *mixed_writer(void *arg) {
     mixed_writer_state_t *state = arg;
@@ -426,6 +481,7 @@ int main(void) {
     test_receive_wakeup();
     test_external_stop();
     test_attach_spawn_and_restart();
+    test_inline_yield_preserves_reduction_budget();
     test_mixed_batch_and_delayed_io();
 #if defined(__linux__) || defined(__APPLE__)
     test_await_registration_failure();
