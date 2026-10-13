@@ -240,10 +240,11 @@ int fr_make_temp_path(char *buf, size_t cap, const char *prefix, const char *suf
     if (!buf || cap == 0) return -1;
 #if defined(FORGE_OS_WINDOWS)
     char temp_dir[MAX_PATH];
-    if (GetTempPathA(sizeof(temp_dir), temp_dir) == 0) return -1;
+    DWORD temp_len = GetTempPathA(sizeof(temp_dir), temp_dir);
+    if (temp_len == 0 || temp_len >= sizeof(temp_dir)) return -1;
     char base[MAX_PATH];
     const char *ext = suffix ? suffix : "";
-    for (;;) {
+    for (unsigned attempt = 0; attempt < 128; ++attempt) {
         if (GetTempFileNameA(temp_dir, prefix ? prefix : "frg", 0, base) == 0)
             return -1;
         if (strlen(base) + strlen(ext) + 1 > cap) {
@@ -262,12 +263,19 @@ int fr_make_temp_path(char *buf, size_t cap, const char *prefix, const char *suf
         }
         strcpy(candidate, base);
         strcat(candidate, ext);
-        if (MoveFileExA(base, candidate, MOVEFILE_FAIL_IF_EXISTS | MOVEFILE_WRITE_THROUGH)) {
+        /* MoveFileEx has no FAIL_IF_EXISTS flag. Omitting REPLACE_EXISTING
+         * preserves an existing destination atomically, without a racy
+         * existence check followed by a replacing move. */
+        if (MoveFileExA(base, candidate, MOVEFILE_WRITE_THROUGH)) {
             memcpy(buf, candidate, strlen(candidate) + 1);
             return 0;
         }
+        DWORD move_error = GetLastError();
         DeleteFileA(base);
+        if (move_error != ERROR_ALREADY_EXISTS && move_error != ERROR_FILE_EXISTS)
+            return -1;
     }
+    return -1;
 #else
     const char *name = prefix ? prefix : "forge";
     const char *ext = suffix ? suffix : "";
