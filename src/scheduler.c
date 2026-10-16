@@ -118,7 +118,7 @@ int fr_sched_pool_available(void) {
 
 static int default_worker_count(int n) {
     if (n > 0) return n;
-    long cpus = fr_platform_cpu_count();
+    long cpus = fr_platform_available_cpu_count();
     return cpus > 0 ? (int)cpus : 4;
 }
 
@@ -220,8 +220,8 @@ static void *worker_main(void *arg) {
     int wid = wa->wid;
     free(wa);
 
-    int cpus = fr_platform_cpu_count();
-    if (cpus > 0) fr_thread_pin_cpu(wid % cpus);
+    /* Keep the creator's affinity. CPU ordinals are not CPU IDs in a sparse
+     * mask; placement policy belongs to the caller and the OS scheduler. */
     tls_worker_id = wid;
     tls_worker_scheduler = sched;
 

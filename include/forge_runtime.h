@@ -37,7 +37,9 @@ struct fr_msg {
     fr_process_t *from;
 };
 
-/* worker_count: 0 = auto (CPU count), 1 = single-threaded cooperative */
+/* worker_count: 0 = auto (Linux caller-affinity CPU count, online fallback),
+ * 1 = single-threaded cooperative. Positive counts remain explicit; workers
+ * inherit the starting thread's affinity rather than imposing CPU placement. */
 fr_scheduler_t *fr_scheduler_create(int worker_count);
 void fr_scheduler_destroy(fr_scheduler_t *sched);
 void fr_scheduler_add_process(fr_scheduler_t *sched, fr_process_t *proc);

@@ -45,6 +45,11 @@ extern "C" {
 void fr_platform_init(void);
 void fr_platform_shutdown(void);
 int fr_platform_cpu_count(void);
+#define FORGE_PLATFORM_HAS_AVAILABLE_CPU_COUNT 1
+/* Linux caller-affinity CPU count for automatic pool sizing. On other targets
+ * or probe failure, falls back to fr_platform_cpu_count(), which can exceed the
+ * caller's allowed CPUs. This is a snapshot, not a CPU quota measurement. */
+int fr_platform_available_cpu_count(void);
 void fr_platform_sleep_forever(void);
 /* Raise RLIMIT_NOFILE before high-concurrency servers (best effort). */
 void fr_platform_tune_for_server(void);

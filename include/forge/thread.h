@@ -27,6 +27,10 @@ int fr_thread_start(fr_thread_t **out, fr_thread_fn fn, void *arg);
 void fr_thread_detach(fr_thread_t *t);
 int fr_thread_join(fr_thread_t *t);
 void fr_thread_yield(void);
+/* Best-effort explicit pin of the calling thread to an absolute Linux CPU ID.
+ * Invalid IDs (<0 or >=CPU_SETSIZE), OS rejection and unsupported targets leave
+ * affinity unchanged. This can change an inherited taskset mask; scheduler
+ * workers themselves keep the creator's mask. Query the OS to confirm success. */
 void fr_thread_pin_cpu(int cpu);
 
 #ifdef __cplusplus

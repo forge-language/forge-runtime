@@ -16,6 +16,9 @@
 #include <netinet/tcp.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(FORGE_OS_LINUX)
+#include <sched.h>
+#endif
 #endif
 
 static int g_net_inited = 0;
@@ -88,6 +91,30 @@ void fr_platform_sleep_us(int microseconds) {
     ts.tv_nsec = (long)(microseconds % 1000000) * 1000L;
     nanosleep(&ts, NULL);
 #endif
+}
+
+int fr_platform_available_cpu_count(void) {
+#if defined(FORGE_OS_LINUX)
+    cpu_set_t local;
+    if (sched_getaffinity(0, sizeof(local), &local) == 0) {
+        int count = CPU_COUNT(&local);
+        if (count > 0) return count;
+    } else if (errno == EINVAL) {
+        /* Large kernel masks can exceed cpu_set_t even when few CPUs are
+         * allowed. Bound probing; other failures retain the online fallback. */
+        for (size_t bytes = sizeof(local) * 2; bytes <= 1024 * 1024; bytes *= 2) {
+            cpu_set_t *mask = (cpu_set_t *)malloc(bytes);
+            if (!mask) break;
+            int result = sched_getaffinity(0, bytes, mask);
+            int error = errno;
+            int count = result == 0 ? CPU_COUNT_S(bytes, mask) : 0;
+            free(mask);
+            if (count > 0) return count;
+            if (result == 0 || error != EINVAL) break;
+        }
+    }
+#endif
+    return fr_platform_cpu_count();
 }
 
 int fr_platform_cpu_count(void) {

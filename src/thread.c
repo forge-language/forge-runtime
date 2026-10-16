@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "forge/thread.h"
 #include <stdlib.h>
 
@@ -189,11 +192,12 @@ void fr_thread_yield(void) {
 }
 
 void fr_thread_pin_cpu(int cpu) {
-#if defined(FORGE_OS_LINUX)
+#if defined(__linux__)
+    if (cpu < 0 || cpu >= CPU_SETSIZE) return;
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET((unsigned)(cpu < 0 ? 0 : cpu), &set);
-    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    CPU_SET(cpu, &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #else
     (void)cpu;
 #endif
