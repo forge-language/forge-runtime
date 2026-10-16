@@ -11,6 +11,7 @@ typedef struct fr_mutex fr_mutex_t;
 typedef struct fr_cond fr_cond_t;
 typedef struct fr_thread fr_thread_t;
 
+/* Create functions return NULL if allocation or native initialization fails. */
 fr_mutex_t *fr_mutex_create(void);
 void fr_mutex_destroy(fr_mutex_t *m);
 void fr_mutex_lock(fr_mutex_t *m);

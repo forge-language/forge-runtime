@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <assert.h>
 
 static char *fr_strdup(const char *s) {
     size_t n = strlen(s);
@@ -74,6 +75,10 @@ struct fr_scheduler {
     unsigned next_queue;
     unsigned next_worker;
     int native_pending;
+    /* -1 leaves unobserved pools untracked. First multi-worker query derives the
+     * claimed count from pending minus queued, under lock; later claims and
+     * completions maintain it. Stop retains both the ledger and backlog. */
+    int native_executing;
     fr_thread_t **workers;
     fr_run_queue_t *worker_queues;
     fr_native_queue_t *native_queues;
@@ -157,19 +162,40 @@ static void refresh_coro_counts_locked(fr_scheduler_t *sched, fr_coro_t *coro) {
     }
 }
 
+static void notify_completion_locked(fr_scheduler_t *sched);
+
+#ifndef NDEBUG
+static void check_dispatch_inventory_locked(fr_scheduler_t *sched) {
+    size_t coroutines = 0, native = 0;
+    for (int i = 0; i < sched->worker_count; i++) {
+        coroutines += sched->worker_queues[i].count;
+        native += sched->native_queues[i].count;
+    }
+    assert(coroutines <= sched->active_coros);
+    assert(coroutines + native == sched->runnable);
+}
+#else
+#define check_dispatch_inventory_locked(sched) ((void)0)
+#endif
+
 /* Scheduler state and queue publication share this mutex. A running coroutine
  * stays exclusively owned by its worker until the worker commits its result. */
 static void enqueue_coro_locked(fr_scheduler_t *sched, fr_coro_t *coro) {
     if (!coro || coro->on_queue || coro->executing) return;
     if (coro->status != FR_CORO_RUNNING) return;
     int wid = coro->proc->worker_id % sched->worker_count;
-    if (!fr_run_queue_try_push(&sched->worker_queues[wid], coro)) {
+    if (!fr_run_queue_try_push_owned(&sched->worker_queues[wid], coro)) {
         coro->status = FR_CORO_ERROR;
         refresh_coro_counts_locked(sched, coro);
+        /* A failed wake can retire the last active coroutine while the run
+         * controller sleeps. Publish that completion even without a worker. */
+        notify_completion_locked(sched);
+        check_dispatch_inventory_locked(sched);
         return;
     }
     coro->on_queue = 1;
     sched->runnable++;
+    check_dispatch_inventory_locked(sched);
     fr_cond_signal(sched->idle_cond);
 }
 
@@ -227,16 +253,25 @@ static void *worker_main(void *arg) {
 
     for (;;) {
         fr_mutex_lock(sched->lock);
+        check_dispatch_inventory_locked(sched);
         while (sched->running && sched->runnable == 0)
             fr_cond_wait(sched->idle_cond, sched->lock);
         if (!sched->running) { fr_mutex_unlock(sched->lock); break; }
 
-        fr_coro_t *coro = fr_run_queue_pop(&sched->worker_queues[wid]);
-        if (!coro) {
-            for (int i = 0; i < sched->worker_count; i++) {
-                if (i == wid) continue;
-                coro = fr_run_queue_steal(&sched->worker_queues[i], &sched->worker_queues[wid]);
-                if (coro) break;
+        fr_coro_t *coro = NULL;
+        /* Only this scheduler can access these queue objects, and all its
+         * publication/claim paths hold sched->lock. A head peek is therefore
+         * stable through the owner-serialized queue operation below. The private
+         * queue mutex is redundant here; standalone queue APIs still lock. */
+        if (sched->active_coros > 0) {
+            if (sched->worker_queues[wid].head)
+                coro = fr_run_queue_pop_owned(&sched->worker_queues[wid]);
+            if (!coro) {
+                for (int i = 0; i < sched->worker_count; i++) {
+                    if (i == wid || !sched->worker_queues[i].head) continue;
+                    coro = fr_run_queue_steal_owned(&sched->worker_queues[i]);
+                    if (coro) break;
+                }
             }
         }
         if (coro) {
@@ -273,19 +308,27 @@ static void *worker_main(void *arg) {
         }
 
         void *narg = NULL;
-        fr_native_fn nfn = fr_native_queue_pop(&sched->native_queues[wid], &narg);
+        fr_native_fn nfn = NULL;
+        if (sched->native_queues[wid].head)
+            nfn = fr_native_queue_pop_owned(&sched->native_queues[wid], &narg);
         if (!nfn) {
             for (int i = 0; i < sched->worker_count; i++) {
-                if (i == wid) continue;
-                nfn = fr_native_queue_steal(&sched->native_queues[i], &narg);
+                if (i == wid || !sched->native_queues[i].head) continue;
+                nfn = fr_native_queue_steal_owned(&sched->native_queues[i], &narg);
                 if (nfn) break;
             }
         }
         if (nfn) {
             sched->runnable--;
+            if (sched->native_executing >= 0) sched->native_executing++;
             fr_mutex_unlock(sched->lock);
             nfn(narg);
             fr_mutex_lock(sched->lock);
+            /* A query can activate tracking while this callback runs. */
+            if (sched->native_executing >= 0) {
+                assert(sched->native_executing > 0);
+                sched->native_executing--;
+            }
             sched->native_pending--;
             notify_completion_locked(sched);
         }
@@ -297,11 +340,11 @@ static void *worker_main(void *arg) {
 }
 
 fr_scheduler_t *fr_scheduler_create(int worker_count) {
-    fr_arena_set_coro_provider(scheduler_coro_arena_provider);
     fr_scheduler_t *s = (fr_scheduler_t *)calloc(1, sizeof(fr_scheduler_t));
     if (!s) return NULL;
     atomic_init(&s->running, 0);
     atomic_init(&s->workers_started, 0);
+    s->native_executing = -1;
     s->worker_count = default_worker_count(worker_count);
     s->event_loop = fr_event_loop_create();
     if (s->event_loop) fr_event_loop_set_cb(s->event_loop, event_resume_cb);
@@ -319,9 +362,16 @@ fr_scheduler_t *fr_scheduler_create(int worker_count) {
     for (int i = 0; i < s->worker_count; i++) {
         fr_run_queue_init(&s->worker_queues[i]);
         fr_native_queue_init(&s->native_queues[i]);
+        if (!s->worker_queues[i].lock || !s->native_queues[i].lock) {
+            fr_scheduler_destroy(s);
+            return NULL;
+        }
     }
+    fr_arena_set_coro_provider(scheduler_coro_arena_provider);
     return s;
 }
+
+static void discard_native(fr_native_fn fn, void *arg);
 
 void fr_scheduler_destroy(fr_scheduler_t *sched) {
     if (!sched) return;
@@ -333,7 +383,7 @@ void fr_scheduler_destroy(fr_scheduler_t *sched) {
     }
     if (sched->native_queues) {
         for (int i = 0; i < sched->worker_count; i++) {
-            fr_native_queue_destroy(&sched->native_queues[i]);
+            fr_native_queue_destroy_with_cleanup(&sched->native_queues[i], discard_native);
         }
     }
     fr_process_t *p = sched->processes;
@@ -366,9 +416,10 @@ static void scheduler_start_workers(fr_scheduler_t *sched) {
 
 void fr_scheduler_start(fr_scheduler_t *sched) {
     if (!sched) return;
+    fr_mutex_lock(sched->lock);
+    while (sched->stopping) fr_cond_wait(sched->idle_cond, sched->lock);
     sched->running = 1;
     fr_scheduler_set_global(sched);
-    fr_mutex_lock(sched->lock);
     scan_enqueue_runnable(sched);
     scheduler_start_workers(sched);
     fr_mutex_unlock(sched->lock);
@@ -389,18 +440,20 @@ void fr_scheduler_stop(fr_scheduler_t *sched) {
     }
     fr_mutex_lock(sched->lock);
     sched->workers_started = 0;
+    /* Clear the old generation before a waiting start can publish this same
+     * scheduler again. An unlocked CAS could erase the new generation. */
+    fr_scheduler_t *expected = sched;
+    atomic_compare_exchange_strong(&g_global_sched, &expected, NULL);
     sched->stopping = 0;
     fr_cond_broadcast(sched->idle_cond);
     fr_mutex_unlock(sched->lock);
-    fr_scheduler_t *expected = sched;
-    atomic_compare_exchange_strong(&g_global_sched, &expected, NULL);
 }
 
 static int sched_pool_submit(fr_scheduler_t *sched, fr_native_fn fn, void *arg) {
     if (!sched || !fn) return 0;
     fr_mutex_lock(sched->lock);
     int q = (int)(sched->next_queue++ % (unsigned)sched->worker_count);
-    int ok = fr_native_queue_try_push(&sched->native_queues[q], fn, arg);
+    int ok = fr_native_queue_try_push_owned(&sched->native_queues[q], fn, arg);
     if (ok) {
         sched->native_pending++;
         sched->runnable++;
@@ -417,9 +470,22 @@ int fr_sched_pool_submit(fr_scheduler_t *sched, void (*fn)(void *), void *arg) {
 size_t fr_sched_pool_queued(fr_scheduler_t *sched) {
     if (!sched) return 0;
     fr_mutex_lock(sched->lock);
-    size_t count = 0;
-    for (int i = 0; i < sched->worker_count; i++)
-        count += fr_native_queue_count(&sched->native_queues[i]);
+    /* One queue is already a constant-cost snapshot; avoid per-callback
+     * accounting in this existing small-pool fast path. */
+    if (sched->worker_count == 1) {
+        size_t count = sched->native_queues[0].count;
+        fr_mutex_unlock(sched->lock);
+        return count;
+    }
+    if (sched->native_executing < 0) {
+        size_t queued = 0;
+        for (int i = 0; i < sched->worker_count; i++)
+            queued += sched->native_queues[i].count;
+        assert(sched->native_pending >= 0 && queued <= (size_t)sched->native_pending);
+        sched->native_executing = sched->native_pending - (int)queued;
+    }
+    assert(sched->native_pending >= sched->native_executing);
+    size_t count = (size_t)(sched->native_pending - sched->native_executing);
     fr_mutex_unlock(sched->lock);
     return count;
 }
@@ -446,14 +512,25 @@ static void sched_native_trampoline1(void *p) {
     fn(arg);
 }
 
-static void sched_native_trampoline2(void *p) {
-    sched_indexed_ctx_t *ctx = (sched_indexed_ctx_t *)p;
-    ctx->fn(ctx->id, ctx->total);
+static void finish_indexed(sched_indexed_ctx_t *ctx) {
     fr_mutex_lock(ctx->lock);
     (*ctx->remaining)--;
     if (*ctx->remaining == 0) fr_cond_broadcast(ctx->done);
     fr_mutex_unlock(ctx->lock);
     free(ctx);
+}
+
+static void sched_native_trampoline2(void *p) {
+    sched_indexed_ctx_t *ctx = (sched_indexed_ctx_t *)p;
+    ctx->fn(ctx->id, ctx->total);
+    finish_indexed(ctx);
+}
+
+/* Only the runtime's private wrappers own their arguments. Public submit's
+ * opaque arguments remain borrowed and user callbacks are never run here. */
+static void discard_native(fr_native_fn fn, void *arg) {
+    if (fn == sched_native_trampoline1) free(arg);
+    else if (fn == sched_native_trampoline2) finish_indexed(arg);
 }
 
 int64_t fr_sched_pool_spawn(fr_sched_native_fn1_t fn, int64_t arg) {
@@ -568,6 +645,10 @@ fr_process_t *fr_process_create(const char *name) {
     p->next_coro_id = 1;
     p->lock = fr_mutex_create();
     p->msg_cond = fr_cond_create();
+    if (!p->name || !p->lock || !p->msg_cond) {
+        fr_process_destroy(p);
+        return NULL;
+    }
     return p;
 }
 
@@ -747,16 +828,21 @@ int64_t fr_await_fd(fr_coro_t *coro, int64_t fd, uint32_t events) {
 
 fr_process_t *fr_supervisor_create(const char *name, fr_restart_policy_t policy) {
     fr_process_t *p = fr_process_create(name);
+    if (!p) return NULL;
     p->is_supervisor = 1;
     p->restart_policy = policy;
     return p;
 }
 
 void fr_supervisor_add_child(fr_process_t *supervisor, fr_process_t *child) {
-    supervisor->child_count++;
-    supervisor->children = (fr_process_t **)realloc(
-        supervisor->children, supervisor->child_count * sizeof(fr_process_t *));
-    supervisor->children[supervisor->child_count - 1] = child;
+    if (!supervisor || !child || supervisor->child_count >= SIZE_MAX / sizeof(fr_process_t *)) return;
+    size_t count = supervisor->child_count + 1;
+    fr_process_t **children = (fr_process_t **)realloc(
+        supervisor->children, count * sizeof(*children));
+    if (!children) return;
+    children[count - 1] = child;
+    supervisor->children = children;
+    supervisor->child_count = count;
 }
 
 int fr_event_poll(fr_scheduler_t *sched, int timeout_ms) {

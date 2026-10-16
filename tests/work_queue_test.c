@@ -282,6 +282,76 @@ static void test_concurrent_recycling(void) {
     free(items); free(seen);
 }
 
+static int discarded;
+static void discard_pending(fr_native_fn fn, void *arg) {
+    CHECK(fn == native_task);
+    CHECK(((item_t *)arg)->id == 2);
+    ++discarded;
+    free(arg);
+}
+static void test_native_terminal_cleanup(void) {
+    fr_native_queue_t q;
+    fr_native_queue_init(&q);
+    item_t *items[3];
+    for (size_t i = 0; i < 3; ++i) {
+        items[i] = malloc(sizeof(*items[i])); CHECK(items[i]); items[i]->id = i;
+    }
+    CHECK(fr_native_queue_push(&q, native_task, items[0]) == 0);
+    CHECK(fr_native_queue_push(&q, native_task, items[1]) == 0);
+    void *arg = NULL;
+    CHECK(fr_native_queue_pop(&q, &arg) == native_task && arg == items[0]); free(arg);
+    CHECK(fr_native_queue_push(&q, native_task, items[2]) == 0);
+    CHECK(fr_native_queue_pop(&q, &arg) == native_task && arg == items[1]); free(arg);
+    CHECK(q.count == 1 && q.free_count == 1);
+    discarded = 0;
+    fr_native_queue_destroy_with_cleanup(&q, discard_pending);
+    CHECK(discarded == 1 && q.head == NULL && q.free_nodes == NULL && q.lock == NULL);
+}
+
+/* Hold the queue mutex as the external owner. Any accidental nested locking
+ * in an owned operation deadlocks instead of being hidden by an uncontended
+ * mutex. Switching back to standalone access happens only after quiescence. */
+static void test_owned_operations(void) {
+    fr_run_queue_t run;
+    fr_native_queue_t native;
+    item_t items[1000];
+    fr_run_queue_init(&run);fr_native_queue_init(&native);
+    CHECK(run.lock && native.lock);
+    fr_mutex_lock(run.lock);fr_mutex_lock(native.lock);
+    void *arg = &items[999];
+    CHECK(!fr_run_queue_pop_owned(&run) && !fr_run_queue_steal_owned(&run));
+    CHECK(!fr_native_queue_pop_owned(&native, &arg) && arg == &items[999]);
+    CHECK(!fr_native_queue_steal_owned(&native, &arg) && arg == &items[999]);
+    CHECK(!fr_native_queue_try_push_owned(&native, NULL, arg));
+    for (size_t i = 0; i < 1000; i++) {
+        CHECK(fr_run_queue_try_push_owned(&run, (fr_coro_t *)&items[i]));
+        CHECK(fr_native_queue_try_push_owned(&native, native_task, &items[i]));
+    }
+    /* Alternating ends forces both unlink cases through cache saturation. */
+    for (size_t i = 0; i < 1000; i++) {
+        size_t expected = i & 1 ? 999 - i / 2 : i / 2;
+        fr_coro_t *c = i & 1 ? fr_run_queue_steal_owned(&run) : fr_run_queue_pop_owned(&run);
+        fr_native_fn fn = i & 1 ? fr_native_queue_steal_owned(&native, &arg)
+                               : fr_native_queue_pop_owned(&native, &arg);
+        CHECK(c == (fr_coro_t *)&items[expected] && fn == native_task && arg == &items[expected]);
+        check_run_links(&run);check_native_links(&native);
+    }
+    CHECK(!run.count && !native.count && run.free_count == 256 && native.free_count == 256);
+    CHECK(fr_run_queue_try_push_owned(&run, (fr_coro_t *)&items[0]));
+    CHECK(fr_native_queue_try_push_owned(&native, native_task, &items[0]));
+    fr_mutex_unlock(native.lock);fr_mutex_unlock(run.lock);
+    CHECK(fr_run_queue_pop(&run) == (fr_coro_t *)&items[0]);
+    CHECK(fr_native_queue_pop(&native, &arg) == native_task && arg == &items[0]);
+    fr_run_queue_push(&run, (fr_coro_t *)&items[1]);
+    CHECK(fr_native_queue_push(&native, native_task, &items[1]) == 0);
+    fr_mutex_lock(run.lock);fr_mutex_lock(native.lock);
+    CHECK(fr_run_queue_steal_owned(&run) == (fr_coro_t *)&items[1]);
+    CHECK(fr_native_queue_steal_owned(&native, &arg) == native_task && arg == &items[1]);
+    fr_mutex_unlock(native.lock);fr_mutex_unlock(run.lock);
+    CHECK(run.free_count == 256 && native.free_count == 256);
+    fr_run_queue_destroy(&run);fr_native_queue_destroy(&native);
+}
+
 int main(void) {
     test_run_operations();
     test_native_operations();
@@ -289,6 +359,8 @@ int main(void) {
     test_concurrent_native();
     test_recycling();
     test_concurrent_recycling();
+    test_native_terminal_cleanup();
+    test_owned_operations();
     puts("work queue tests passed");
     return 0;
 }

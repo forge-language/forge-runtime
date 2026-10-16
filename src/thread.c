@@ -121,7 +121,7 @@ struct fr_thread {
 
 fr_mutex_t *fr_mutex_create(void) {
     fr_mutex_t *m = (fr_mutex_t *)calloc(1, sizeof(fr_mutex_t));
-    if (m) pthread_mutex_init(&m->lock, NULL);
+    if (m && pthread_mutex_init(&m->lock, NULL) != 0) { free(m); return NULL; }
     return m;
 }
 
@@ -141,7 +141,7 @@ void fr_mutex_unlock(fr_mutex_t *m) {
 
 fr_cond_t *fr_cond_create(void) {
     fr_cond_t *c = (fr_cond_t *)calloc(1, sizeof(fr_cond_t));
-    if (c) pthread_cond_init(&c->cv, NULL);
+    if (c && pthread_cond_init(&c->cv, NULL) != 0) { free(c); return NULL; }
     return c;
 }
 

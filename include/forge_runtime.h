@@ -40,7 +40,15 @@ struct fr_msg {
 /* worker_count: 0 = auto (Linux caller-affinity CPU count, online fallback),
  * 1 = single-threaded cooperative. Positive counts remain explicit; workers
  * inherit the starting thread's affinity rather than imposing CPU placement. */
+/* Construction returns NULL without publishing a partially initialized owner
+ * if any required allocation, native primitive or event loop fails. */
 fr_scheduler_t *fr_scheduler_create(int worker_count);
+/* External-owner lifecycle operations. Keep the scheduler alive through all
+ * start/stop/run calls; callbacks must not wait on their own pool's lifecycle.
+ * Before destroy, quiesce publication and other lifecycle callers. Destroy
+ * discards unclaimed internal spawn wrappers without running user functions;
+ * already-published indexed waiters are released when those jobs are discarded.
+ * Direct-submit arguments remain caller-owned if their callback never ran. */
 void fr_scheduler_destroy(fr_scheduler_t *sched);
 void fr_scheduler_add_process(fr_scheduler_t *sched, fr_process_t *proc);
 void fr_scheduler_start(fr_scheduler_t *sched);
@@ -58,17 +66,24 @@ int64_t fr_sched_pool_spawn(fr_sched_native_fn1_t fn, int64_t arg);
 void fr_sched_pool_spawn_indexed(fr_sched_native_fn2_t fn, int64_t count);
 int fr_sched_pool_available(void);
 int fr_sched_pool_submit(fr_scheduler_t *sched, void (*fn)(void *), void *arg);
+/* Exact queued-only snapshot at the scheduler lock; excludes running callbacks.
+ * Multi-worker accounting initializes on the first query with one queue scan.
+ * A depth check followed by submit does not reserve capacity across callers. */
 size_t fr_sched_pool_queued(fr_scheduler_t *sched);
 
+/* NULL on incomplete construction; a successful process owns its name, mutex
+ * and condition variable. Callers must check before attaching or spawning. */
 fr_process_t *fr_process_create(const char *name);
 void fr_process_destroy(fr_process_t *proc);
 fr_scheduler_t *fr_process_scheduler(fr_process_t *proc);
 const char *fr_process_name(fr_process_t *proc);
 void fr_process_set_receive_handler(fr_process_t *proc, fr_coro_fn handler, size_t state_size);
 
-/* On success the runtime takes ownership of heap-allocated init_state and
- * frees it when the owning process destroys the coroutine. On failure, the
- * caller retains ownership. A zero-sized state may use NULL. */
+/* A non-NULL return consumes heap-allocated init_state: positive-sized state
+ * is retained until process destruction, and zero-sized input is freed
+ * immediately (NULL is allowed). A NULL return leaves ownership with the caller.
+ * A non-NULL coroutine may already have a terminal queue-publication error;
+ * ownership transfer does not guarantee execution. */
 fr_coro_t *fr_coro_spawn(fr_process_t *proc, fr_coro_fn fn, void *init_state, size_t state_size);
 fr_coro_status_t fr_yield(fr_coro_t *coro);
 /* Generated coroutine code may continue through a logical yield in the same
@@ -103,6 +118,9 @@ void fr_msg_free_payload(fr_msg_t *msg);
 int64_t fr_await_fd(fr_coro_t *coro, int64_t fd, uint32_t events);
 
 fr_process_t *fr_supervisor_create(const char *name, fr_restart_policy_t policy);
+/* Best-effort borrowed child registration. Growth failure leaves the previous
+ * list unchanged; child ownership is not transferred. Configuration requires
+ * caller-exclusive access. Not automatic recovery. */
 void fr_supervisor_add_child(fr_process_t *supervisor, fr_process_t *child);
 
 int fr_event_poll(fr_scheduler_t *sched, int timeout_ms);

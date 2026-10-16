@@ -14,7 +14,7 @@ find_package(Threads REQUIRED)
 
 add_library(forge_runtime STATIC
     src/arena.c src/scheduler.c src/work_queue.c src/event_loop.c
-    src/ownership.c src/platform.c src/thread.c)
+    src/ownership.c src/platform.c src/thread.c src/work_queue_owned.c)
 add_library(ForgeRuntime::runtime ALIAS forge_runtime)
 set_target_properties(forge_runtime PROPERTIES EXPORT_NAME runtime)
 target_include_directories(forge_runtime PUBLIC
@@ -53,7 +53,7 @@ if(BUILD_TESTING)
         list(APPEND runtime_tests scheduler)
     endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        list(APPEND runtime_tests event_loop)
+        list(APPEND runtime_tests event_loop dispatch factory queue_owner)
     endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(affinity_test tests/affinity_test.c)
@@ -64,11 +64,44 @@ if(BUILD_TESTING)
             "-Wl,--wrap=pthread_setaffinity_np")
         add_test(NAME affinity_regressions COMMAND affinity_test)
         set_tests_properties(affinity_regressions PROPERTIES TIMEOUT 30)
+        add_executable(lifecycle_test tests/lifecycle_test.c)
+        target_link_libraries(lifecycle_test PRIVATE ForgeRuntime::runtime)
+        target_include_directories(lifecycle_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_options(lifecycle_test PRIVATE -UNDEBUG)
+        target_link_options(lifecycle_test PRIVATE "-Wl,--wrap=malloc" "-Wl,--wrap=free"
+            "-Wl,--wrap=fr_cond_wait" "-Wl,--wrap=fr_mutex_unlock"
+            "-Wl,--wrap=fr_native_queue_try_push_owned")
+        add_test(NAME lifecycle_regressions COMMAND lifecycle_test)
+        set_tests_properties(lifecycle_regressions PROPERTIES TIMEOUT 30)
+        add_executable(native_depth_test tests/native_depth_test.c)
+        target_link_libraries(native_depth_test PRIVATE ForgeRuntime::runtime)
+        target_compile_options(native_depth_test PRIVATE -UNDEBUG)
+        target_link_options(native_depth_test PRIVATE "-Wl,--wrap=malloc" "-Wl,--wrap=fr_thread_start")
+        add_test(NAME native_depth_regressions COMMAND native_depth_test)
+        set_tests_properties(native_depth_regressions PROPERTIES TIMEOUT 30)
     endif()
     foreach(name IN LISTS runtime_tests)
         add_executable(${name}_test "tests/${name}_test.c")
         target_link_libraries(${name}_test PRIVATE ForgeRuntime::runtime)
         target_include_directories(${name}_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        if(name STREQUAL "dispatch")
+            target_link_options(${name}_test PRIVATE "-Wl,--wrap=fr_run_queue_try_push_owned"
+                "-Wl,--wrap=fr_thread_start" "-Wl,--wrap=fr_cond_wait" "-Wl,--wrap=fr_cond_signal")
+        endif()
+        if(name STREQUAL "factory")
+            target_link_options(${name}_test PRIVATE "-Wl,--wrap=malloc" "-Wl,--wrap=calloc"
+                "-Wl,--wrap=realloc" "-Wl,--wrap=free" "-Wl,--wrap=pthread_mutex_init"
+                "-Wl,--wrap=pthread_mutex_destroy" "-Wl,--wrap=pthread_cond_init"
+                "-Wl,--wrap=pthread_cond_destroy" "-Wl,--wrap=epoll_create1" "-Wl,--wrap=close")
+        endif()
+        if(name STREQUAL "queue_owner")
+            foreach(symbol IN ITEMS fr_mutex_create fr_mutex_lock fr_mutex_unlock fr_cond_wait
+                    malloc fr_thread_start fr_run_queue_try_push_owned fr_run_queue_pop_owned
+                    fr_run_queue_steal_owned fr_native_queue_try_push_owned
+                    fr_native_queue_pop_owned fr_native_queue_steal_owned)
+                target_link_options(${name}_test PRIVATE "-Wl,--wrap=${symbol}")
+            endforeach()
+        endif()
         if(MSVC)
             target_compile_options(${name}_test PRIVATE /UNDEBUG)
         else()
